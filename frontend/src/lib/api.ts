@@ -400,6 +400,8 @@ export interface CuratedSearchRequest {
 
 export interface CuratedStayOption {
   hotelId: string;
+  quote_id?: string;
+  quoteId?: string;
   hotelName: string;
   location: string;
   price: number;

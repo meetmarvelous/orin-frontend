@@ -201,8 +201,7 @@ function splitGuestName(name: string) {
 }
 
 function getStayQuoteId(option: CuratedStayOption) {
-  const extended = option as CuratedStayOption & { quote_id?: string; quoteId?: string };
-  return extended.quote_id || extended.quoteId || option.hotelId;
+  return option.quote_id || option.quoteId;
 }
 
 async function findAssociatedTokenAddress(mint: PublicKey, owner: PublicKey) {
@@ -630,8 +629,13 @@ export default function Frontend2App() {
     setIsFinalizingBooking(true);
     const loadingId = appendMessage({ role: "orin", text: "Submitting booking request..." });
     try {
+      const quoteId = getStayQuoteId(selectedStay);
+      if (!quoteId) {
+        throw new Error("Selected stay is missing quote_id. Please refresh curated stays and choose again.");
+      }
+
       const response = await bookStay({
-        quote_id: getStayQuoteId(selectedStay),
+        quote_id: quoteId,
         email: getPrivyEmail(user) || `${guestName.trim().replace(/\s+/g, ".").toLowerCase() || "guest"}@orin.ai`,
         phone_number: "+1234567890",
         guests: [splitGuestName(guestName)],
