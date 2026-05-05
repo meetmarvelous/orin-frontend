@@ -11,10 +11,12 @@ export interface AiResultPayload {
   lighting?: "warm" | "cold" | "ambient";
   brightness?: number;
   music?: string;
+  music_url?: string;
   musicOn?: boolean;
   services?: string[];
   raw_response?: string;
   text?: string;
+  action_required?: boolean;
   [key: string]: string | number | boolean | string[] | undefined;
 }
 
@@ -44,6 +46,7 @@ export interface VoiceCommandResponse {
   guestPda: string;
   message: string;
   hash: string;
+  action_required?: boolean;
   requiresSignature?: boolean;
   aiResult?: AiResultPayload;
 }
@@ -62,6 +65,7 @@ export interface ManualPreferencesResponse {
   status: "success";
   info: string;
   hash: string;
+  action_required?: boolean;
   requiresSignature?: boolean;
 }
 
@@ -252,6 +256,7 @@ export interface RoomDeviceState {
     mode: string;
   };
   music: string;
+  music_url?: string;
   lastUpdatedAt: string | null;
   lastGuestPda: string | null;
 }
@@ -444,6 +449,46 @@ export interface BookingSummary {
   currency: string;
 }
 
+export interface PusdFaucetResponse {
+  status: "ok";
+  message: string;
+  signature: string;
+}
+
+export interface BookStayGuest {
+  given_name: string;
+  family_name: string;
+}
+
+export type BookStayPaymentMethod = "PUSD" | "Fiat";
+
+export interface BookStayRequest {
+  quote_id: string;
+  email: string;
+  phone_number: string;
+  guests: BookStayGuest[];
+  payment_method?: BookStayPaymentMethod;
+  amount_usd: number;
+}
+
+export interface PusdPaymentDetails {
+  mint: string;
+  amount: number;
+  decimals: number;
+  memo_hash: string;
+  recipient: string;
+}
+
+export interface BookStayResponse {
+  status: string;
+  action_required?: boolean;
+  message?: string;
+  payment_details?: PusdPaymentDetails;
+  booking?: unknown;
+  confirmation?: string;
+  [key: string]: unknown;
+}
+
 /**
  * POST /api/v1/stays/curated-search
  *
@@ -475,6 +520,36 @@ export async function fetchCuratedStays(
   if (!response.ok) {
     const errorBody = await response.text();
     throw new Error(`Curated search API error (${response.status}): ${errorBody}`);
+  }
+
+  return response.json();
+}
+
+export async function requestPusdFaucet(walletAddress: string): Promise<PusdFaucetResponse> {
+  const response = await fetch(`${API_BASE}/api/v1/faucet/pusd`, {
+    method: "POST",
+    headers: getApiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ walletAddress }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`PUSD faucet API error (${response.status}): ${errorBody}`);
+  }
+
+  return response.json();
+}
+
+export async function bookStay(payload: BookStayRequest): Promise<BookStayResponse> {
+  const response = await fetch(`${API_BASE}/api/v1/stays/book`, {
+    method: "POST",
+    headers: getApiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Book stay API error (${response.status}): ${errorBody}`);
   }
 
   return response.json();

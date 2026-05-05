@@ -53,6 +53,7 @@ export interface SavePreferencesResult {
   hashHex: string;
   solanaTxSignature?: string;
   requiresSignature?: boolean;
+  actionRequired?: boolean;
   aiResult?: AiResultPayload;
 }
 
@@ -91,7 +92,9 @@ export async function saveVoicePreferences(
 
   let txSignature: string | undefined = undefined;
 
-  if (apiResponse.requiresSignature) {
+  const actionRequired = apiResponse.action_required === true || apiResponse.requiresSignature === true;
+
+  if (actionRequired) {
     const { identifierHash } = deriveGuestPda(guestIdentifier, ownerPubkey);
     txSignature = await updatePreferencesOnChain(
       program, guestPda, ownerPubkey, hashBytes,
@@ -104,7 +107,8 @@ export async function saveVoicePreferences(
     apiAccepted: apiResponse.status === "accepted", 
     hashHex, 
     solanaTxSignature: txSignature,
-    requiresSignature: apiResponse.requiresSignature,
+    requiresSignature: actionRequired,
+    actionRequired,
     aiResult: apiResponse.aiResult
   };
 }
@@ -140,7 +144,7 @@ export async function saveManualPreferences(
 
   // Sign only when the backend explicitly asks for a hash-lock update.
   // This keeps manual controls aligned with the intent-driven signature contract.
-  const requiresSignature = apiResponse.requiresSignature === true;
+  const requiresSignature = apiResponse.action_required === true;
 
   if (requiresSignature) {
     const { identifierHash } = deriveGuestPda(guestName, ownerPubkey);
@@ -156,5 +160,6 @@ export async function saveManualPreferences(
     hashHex, 
     solanaTxSignature: txSignature,
     requiresSignature,
+    actionRequired: requiresSignature,
   };
 }

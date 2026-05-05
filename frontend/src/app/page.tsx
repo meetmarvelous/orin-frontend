@@ -1,10 +1,11 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Buffer } from "buffer";
 import Image from "next/image";
 import { AnimatePresence, motion } from "framer-motion";
 import { Idl } from "@coral-xyz/anchor";
-import { PublicKey, Transaction } from "@solana/web3.js";
+import { PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { usePrivy } from "@privy-io/react-auth";
 import { useSignTransaction as usePrivySignTransaction, useWallets as usePrivySolanaWallets } from "@privy-io/react-auth/solana";
@@ -13,16 +14,19 @@ import { BedDouble, Camera, Check, ChevronLeft, Home, Lightbulb, LogOut, MapPin,
 import { BrandWordmark, ConsentArt } from "./orin-ui";
 import {
   buildBookingSummary,
+  bookStay,
   fetchCuratedStays,
   fetchDeviceStatus,
   fetchFastVoiceReply,
   fetchGuestProfileApi,
   fetchTtsAudio,
+  requestPusdFaucet,
   updateGuestAvatar,
   type BookingSummary,
   type CuratedSearchRequest,
   type CuratedStayOption,
   type GuestProfileRecord,
+  type PusdPaymentDetails,
 } from "../lib/api";
 import { deriveGuestPda } from "../lib/pda";
 import { getConnection, getProgram, getProvider } from "../lib/solana";
@@ -47,6 +51,10 @@ type SignerWallet = {
   signTransaction?: (tx: Transaction) => Promise<Transaction>;
   signAllTransactions?: (txs: Transaction[]) => Promise<Transaction[]>;
 };
+
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 const searchDefaults: CuratedSearchRequest = {
   check_in_date: "2026-06-10",
@@ -175,6 +183,115 @@ function buildRoomPrefsFromAnswers(answers: Record<string, string>): RoomPrefere
   };
 }
 
+function getPrivyEmail(user: unknown) {
+  const record = user as { email?: { address?: string } | string; linkedAccounts?: Array<Record<string, unknown>> } | null;
+  if (!record) return "";
+  if (typeof record.email === "string") return record.email;
+  if (record.email?.address) return record.email.address;
+  const emailAccount = record.linkedAccounts?.find((account) => account.type === "email" && typeof account.address === "string");
+  return typeof emailAccount?.address === "string" ? emailAccount.address : "";
+}
+
+function splitGuestName(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  return {
+    given_name: parts[0] || "ORIN",
+    family_name: parts.slice(1).join(" ") || "Guest",
+  };
+}
+
+function getStayQuoteId(option: CuratedStayOption) {
+  const extended = option as CuratedStayOption & { quote_id?: string; quoteId?: string };
+  return extended.quote_id || extended.quoteId || option.hotelId;
+}
+
+async function findAssociatedTokenAddress(mint: PublicKey, owner: PublicKey) {
+  const [address] = await PublicKey.findProgramAddress(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  return address;
+}
+
+function createAssociatedTokenAccountIdempotentInstruction(
+  payer: PublicKey,
+  ata: PublicKey,
+  owner: PublicKey,
+  mint: PublicKey
+) {
+  return new Transaction().add({
+    programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: false, isWritable: false },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from([1]),
+  }).instructions[0];
+}
+
+function createTransferCheckedInstruction(
+  source: PublicKey,
+  mint: PublicKey,
+  destination: PublicKey,
+  owner: PublicKey,
+  amount: bigint,
+  decimals: number
+) {
+  const data = Buffer.alloc(10);
+  data.writeUInt8(12, 0);
+  data.writeBigUInt64LE(amount, 1);
+  data.writeUInt8(decimals, 9);
+  return new Transaction().add({
+    programId: TOKEN_PROGRAM_ID,
+    keys: [
+      { pubkey: source, isSigner: false, isWritable: true },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: destination, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: false },
+    ],
+    data,
+  }).instructions[0];
+}
+
+async function executePusdPaymentTransfer(
+  signerWallet: SignerWallet,
+  details: PusdPaymentDetails
+) {
+  if (!signerWallet.signTransaction) {
+    throw new Error("Connected wallet does not support transaction signing.");
+  }
+
+  const payer = signerWallet.publicKey;
+  const mint = new PublicKey(details.mint);
+  const recipient = new PublicKey(details.recipient);
+  const sourceAta = await findAssociatedTokenAddress(mint, payer);
+  const recipientAta = await findAssociatedTokenAddress(mint, recipient);
+  const units = BigInt(Math.round(details.amount * 10 ** details.decimals));
+  const connection = getConnection();
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const tx = new Transaction({ feePayer: payer, recentBlockhash: blockhash });
+
+  tx.add(createAssociatedTokenAccountIdempotentInstruction(payer, sourceAta, payer, mint));
+  tx.add(createAssociatedTokenAccountIdempotentInstruction(payer, recipientAta, recipient, mint));
+  tx.add(createTransferCheckedInstruction(sourceAta, mint, recipientAta, payer, units, details.decimals));
+  if (details.memo_hash) {
+    tx.add({
+      programId: MEMO_PROGRAM_ID,
+      keys: [],
+      data: Buffer.from(details.memo_hash, "utf8"),
+    });
+  }
+
+  const signed = await signerWallet.signTransaction(tx);
+  const signature = await connection.sendRawTransaction(signed.serialize());
+  await connection.confirmTransaction(signature, "confirmed");
+  return signature;
+}
+
 export default function Frontend2App() {
   const walletAdapter = useWallet();
   const { authenticated, login, logout, ready, user } = usePrivy();
@@ -194,8 +311,11 @@ export default function Frontend2App() {
   const [brightness, setBrightness] = useState(80);
   const [lighting, setLighting] = useState<LightingMode>("warm");
   const [music, setMusic] = useState("Jazz");
+  const [musicUrl, setMusicUrl] = useState("");
   const [musicOn, setMusicOn] = useState(true);
   const [isSavingRoom, setIsSavingRoom] = useState(false);
+  const [isAirdroppingPusd, setIsAirdroppingPusd] = useState(false);
+  const [isFinalizingBooking, setIsFinalizingBooking] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: "welcome", role: "orin", text: "Welcome back. I'm ORIN, your personal AI concierge. All systems are online." },
@@ -325,6 +445,7 @@ export default function Frontend2App() {
       setMusic(state.music || "Jazz");
       setMusicOn(Boolean(state.music));
     }
+    if (typeof state.music_url === "string") setMusicUrl(state.music_url);
   }, []);
 
   const refreshGroundTruth = useCallback(async () => {
@@ -358,6 +479,9 @@ export default function Frontend2App() {
           if (typeof parsed.music === "string") {
             setMusic(parsed.music || "Jazz");
             setMusicOn(Boolean(parsed.music));
+          }
+          if (typeof (parsed as Partial<RoomPreferences> & { music_url?: string }).music_url === "string") {
+            setMusicUrl((parsed as Partial<RoomPreferences> & { music_url?: string }).music_url || "");
           }
         } catch {
           localStorage.removeItem(`orin_frontend2_room_${derivedAddress}`);
@@ -496,11 +620,46 @@ export default function Frontend2App() {
     setActiveTab("chat");
   };
 
-  const finalizeBooking = () => {
+  const finalizeBooking = async () => {
     if (!selectedStay || !paymentMethod) return;
-    setBookingApproved(true);
-    setMessages((current) => current.map((message) => message.card?.type === "payment" ? { ...message, card: { ...message.card, approved: true } } : message));
-    appendMessage({ role: "orin", text: `Booking confirmed for ${selectedStay.hotelName}. Payment method: ${paymentMethod === "pusd" ? "$PUSD" : "Mastercard"}. Confirmation: ORIN-${Date.now().toString(36).toUpperCase()}` });
+    if (paymentMethod === "pusd" && (!effectivePublicKey || !signerWallet)) {
+      appendMessage({ role: "orin", text: "Wallet signer is not ready yet. Please reconnect through Privy before approving $PUSD payment." });
+      return;
+    }
+
+    setIsFinalizingBooking(true);
+    const loadingId = appendMessage({ role: "orin", text: "Submitting booking request..." });
+    try {
+      const response = await bookStay({
+        quote_id: getStayQuoteId(selectedStay),
+        email: getPrivyEmail(user) || `${guestName.trim().replace(/\s+/g, ".").toLowerCase() || "guest"}@orin.ai`,
+        phone_number: "+1234567890",
+        guests: [splitGuestName(guestName)],
+        payment_method: paymentMethod === "pusd" ? "PUSD" : "Fiat",
+        amount_usd: bookingSummary?.payableTotal ?? selectedStay.price,
+      });
+
+      let paymentSignature = "";
+      if (paymentMethod === "pusd" && response.action_required === true) {
+        if (!response.payment_details) {
+          throw new Error("Backend requested payment approval but did not return payment_details.");
+        }
+        replaceMessage(loadingId, { text: response.message || "Payment required. Please approve the $PUSD transaction in your wallet." });
+        paymentSignature = await executePusdPaymentTransfer(signerWallet!, response.payment_details);
+      }
+
+      setBookingApproved(true);
+      setMessages((current) => current.map((message) => message.card?.type === "payment" ? { ...message, card: { ...message.card, approved: true } } : message));
+      replaceMessage(loadingId, {
+        text: paymentSignature
+          ? `Booking payment approved with $PUSD. TX Signature: [${paymentSignature.slice(0, 12)}...](https://explorer.solana.com/tx/${paymentSignature}?cluster=devnet)`
+          : response.message || `Booking confirmed for ${selectedStay.hotelName}. Payment method: ${paymentMethod === "pusd" ? "$PUSD" : "Mastercard"}.`,
+      });
+    } catch (error) {
+      replaceMessage(loadingId, { text: `Booking error: ${getErrorMessage(error)}` });
+    } finally {
+      setIsFinalizingBooking(false);
+    }
   };
 
   const handleVoiceOrTextCommand = useCallback(async (input: string) => {
@@ -552,6 +711,7 @@ export default function Frontend2App() {
           setMusic(result.aiResult.music || "Jazz");
           setMusicOn(Boolean(result.aiResult.music));
         }
+        if (typeof result.aiResult.music_url === "string") setMusicUrl(result.aiResult.music_url);
         if (result.aiResult.raw_response) {
           fetchTtsAudio(result.aiResult.raw_response)
             .then((tts) => playAudio(tts.audioBase64, tts.mimeType, activeAudioRef))
@@ -583,7 +743,7 @@ export default function Frontend2App() {
       const program = getProgram(provider, idl as Idl);
       const result = await saveManualPreferences(program, guestPda, effectivePublicKey, roomPrefs, guestName);
       if (derivedAddress) {
-        localStorage.setItem(`orin_frontend2_room_${derivedAddress}`, JSON.stringify(roomPrefs));
+        localStorage.setItem(`orin_frontend2_room_${derivedAddress}`, JSON.stringify({ ...roomPrefs, music_url: musicUrl }));
       }
       const message = result.solanaTxSignature
         ? `Environment preferences synchronized. Transaction was subsidized by ORIN Relay (Gasless). TX Signature: [${result.solanaTxSignature.slice(0, 12)}...](https://explorer.solana.com/tx/${result.solanaTxSignature}?cluster=devnet)`
@@ -609,6 +769,25 @@ export default function Frontend2App() {
       if (guestPda) updateGuestAvatar(guestPda.toBase58(), dataUrl).catch((error) => console.warn(`[ORIN] Avatar sync failed: ${getErrorMessage(error)}`));
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleAirdropPusd = async () => {
+    if (!derivedAddress) {
+      appendMessage({ role: "orin", text: "Connect a Privy Solana wallet before requesting test $PUSD." });
+      setActiveTab("chat");
+      return;
+    }
+    setIsAirdroppingPusd(true);
+    try {
+      const response = await requestPusdFaucet(derivedAddress);
+      appendMessage({ role: "orin", text: `${response.message} Faucet TX: [${response.signature.slice(0, 12)}...](https://explorer.solana.com/tx/${response.signature}?cluster=devnet)` });
+      setActiveTab("chat");
+    } catch (error) {
+      appendMessage({ role: "orin", text: `PUSD faucet error: ${getErrorMessage(error)}` });
+      setActiveTab("chat");
+    } finally {
+      setIsAirdroppingPusd(false);
+    }
   };
 
   if (view === "landing") return <Landing ready={ready} onLogin={login} />;
@@ -641,10 +820,10 @@ export default function Frontend2App() {
         <AnimatePresence mode="wait">
           <motion.section key={activeTab} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} className={cn("dashboard-screen", `dashboard-screen--${activeTab}`)}>
             {activeTab === "home" && <HomeScreen guestName={guestName} persona={persona} temp={temp} brightness={brightness} lighting={lighting} music={musicOn ? music : "Off"} onChat={() => setActiveTab("chat")} onRoom={() => setActiveTab("room")} onBook={() => void handleCuratedSearch("Recommend premium hotel stays that fit my ORIN profile.")} />}
-            {activeTab === "chat" && <ChatScreen messages={messages} input={chatInput} setInput={setChatInput} isBusy={isChatBusy} onSend={() => void handleVoiceOrTextCommand(chatInput)} onRecommend={() => void handleCuratedSearch("Recommend curated stays for two nights.")} onBack={() => setActiveTab("home")} onSelectStay={selectStay} onConfirm={showPayment} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={bookingApproved} onFinalize={finalizeBooking} messagesEndRef={messagesEndRef} />}
-            {activeTab === "booking" && <BookingScreen messages={messages} isLoading={isChatBusy} selectedStay={selectedStay} summary={bookingSummary} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={bookingApproved} onSearch={() => void handleCuratedSearch("Show me premium hotel options for my next stay.")} onSelect={selectStay} onConfirm={showPayment} onFinalize={finalizeBooking} />}
-            {activeTab === "room" && <RoomScreen temp={temp} setTemp={updateTemp} brightness={brightness} setBrightness={updateBrightness} lighting={lighting} setLighting={updateLighting} music={music} setMusic={updateMusic} musicOn={musicOn} setMusicOn={updateMusicOn} isSaving={isSavingRoom} onSave={() => void saveRoom()} />}
-            {activeTab === "profile" && <ProfileScreen guestName={guestName} walletLabel={walletLabel} profileImage={profileImage} persona={persona} points={loyaltyPoints} temp={temp} brightness={brightness} lighting={lighting} music={musicOn ? music : "Off"} onAvatarChange={handleAvatarChange} />}
+            {activeTab === "chat" && <ChatScreen messages={messages} input={chatInput} setInput={setChatInput} isBusy={isChatBusy} onSend={() => void handleVoiceOrTextCommand(chatInput)} onRecommend={() => void handleCuratedSearch("Recommend curated stays for two nights.")} onBack={() => setActiveTab("home")} onSelectStay={selectStay} onConfirm={showPayment} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={bookingApproved} onFinalize={() => void finalizeBooking()} isFinalizing={isFinalizingBooking} messagesEndRef={messagesEndRef} />}
+            {activeTab === "booking" && <BookingScreen messages={messages} isLoading={isChatBusy} selectedStay={selectedStay} summary={bookingSummary} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={bookingApproved} onSearch={() => void handleCuratedSearch("Show me premium hotel options for my next stay.")} onSelect={selectStay} onConfirm={showPayment} onFinalize={() => void finalizeBooking()} isFinalizing={isFinalizingBooking} />}
+            {activeTab === "room" && <RoomScreen temp={temp} setTemp={updateTemp} brightness={brightness} setBrightness={updateBrightness} lighting={lighting} setLighting={updateLighting} music={music} musicUrl={musicUrl} setMusic={updateMusic} musicOn={musicOn} setMusicOn={updateMusicOn} isSaving={isSavingRoom} onSave={() => void saveRoom()} />}
+            {activeTab === "profile" && <ProfileScreen guestName={guestName} walletLabel={walletLabel} profileImage={profileImage} persona={persona} points={loyaltyPoints} temp={temp} brightness={brightness} lighting={lighting} music={musicOn ? music : "Off"} onAvatarChange={handleAvatarChange} onAirdropPusd={() => void handleAirdropPusd()} isAirdroppingPusd={isAirdroppingPusd} />}
           </motion.section>
         </AnimatePresence>
 
@@ -904,7 +1083,7 @@ function HomeScreen({ guestName, persona, temp, brightness, lighting, music, onC
   return <section className="app-home app-home--figma"><div className="post-home-greeting app-home-greeting"><div><p>Welcome back,</p><strong>{guestName}</strong><span className="app-home-subtitle">Hotel Bellweather, Suite 1234</span></div><span className="chat-status chat-status--home">ORIN ACTIVE</span></div><article className="home-hero-card"><div className="home-hero-copy"><span className="home-hero-kicker">Long-term memory</span><strong>Everything is tuned to your profile</strong><p>{persona}</p></div><div className="home-hero-orb"><div className="home-hero-orb-core" /></div></article><div className="quick-card-list quick-card-list--home">{[{ label: "Music", value: music, icon: Music }, { label: "Lights", value: `${lighting} / ${brightness}%`, icon: Lightbulb }, { label: "Temperature", value: `${temp}°C`, icon: Thermometer }].map((card) => <article className="quick-card quick-card--home" key={card.label}><div className="quick-card-icon quick-card-icon--home"><card.icon size={18} /></div><div className="quick-card-copy"><span>{card.label}</span><strong>{card.value}</strong></div></article>)}</div><div className="home-actions home-actions--figma"><button className="setup-button setup-button--figma home-primary" onClick={onChat} type="button"><span className="home-cta-inner"><Mic size={18} /><span>Talk to ORIN</span></span></button><button className="auth-secondary auth-secondary--figma" onClick={onRoom} type="button">Room control</button><button className="auth-secondary auth-secondary--figma" onClick={onBook} type="button">Curate stays</button></div></section>;
 }
 
-function ChatScreen({ messages, input, setInput, isBusy, onSend, onRecommend, onBack, onSelectStay, onConfirm, paymentMethod, setPaymentMethod, approved, onFinalize, messagesEndRef }: { messages: ChatMessage[]; input: string; setInput: (value: string) => void; isBusy: boolean; onSend: () => void; onRecommend: () => void; onBack: () => void; onSelectStay: (option: CuratedStayOption) => void; onConfirm: () => void; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved: boolean; onFinalize: () => void; messagesEndRef: React.RefObject<HTMLDivElement | null> }) {
+function ChatScreen({ messages, input, setInput, isBusy, onSend, onRecommend, onBack, onSelectStay, onConfirm, paymentMethod, setPaymentMethod, approved, onFinalize, isFinalizing, messagesEndRef }: { messages: ChatMessage[]; input: string; setInput: (value: string) => void; isBusy: boolean; onSend: () => void; onRecommend: () => void; onBack: () => void; onSelectStay: (option: CuratedStayOption) => void; onConfirm: () => void; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved: boolean; onFinalize: () => void; isFinalizing: boolean; messagesEndRef: React.RefObject<HTMLDivElement | null> }) {
   const hasBookingContext = messages.some((message) => message.card?.type === "stays" || message.card?.type === "confirmation" || message.card?.type === "payment");
   const statusLabel = isBusy ? "Listening" : hasBookingContext ? "Booking Active" : "Active";
 
@@ -922,7 +1101,7 @@ function ChatScreen({ messages, input, setInput, isBusy, onSend, onRecommend, on
       </header>
 
       <div className="chat-thread">
-        {messages.map((message) => <ChatMessageView key={message.id} message={message} onSelectStay={onSelectStay} onConfirm={onConfirm} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={approved} onFinalize={onFinalize} />)}
+        {messages.map((message) => <ChatMessageView key={message.id} message={message} onSelectStay={onSelectStay} onConfirm={onConfirm} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={approved} onFinalize={onFinalize} isFinalizing={isFinalizing} />)}
         {isBusy ? <article className="orin-message"><small>○ Orin</small><p>Working on that...</p></article> : null}
         <div ref={messagesEndRef} />
       </div>
@@ -943,14 +1122,14 @@ function ChatScreen({ messages, input, setInput, isBusy, onSend, onRecommend, on
   );
 }
 
-function ChatMessageView({ message, onSelectStay, onConfirm, paymentMethod, setPaymentMethod, approved, onFinalize }: { message: ChatMessage; onSelectStay: (option: CuratedStayOption) => void; onConfirm: () => void; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved: boolean; onFinalize: () => void }) {
+function ChatMessageView({ message, onSelectStay, onConfirm, paymentMethod, setPaymentMethod, approved, onFinalize, isFinalizing }: { message: ChatMessage; onSelectStay: (option: CuratedStayOption) => void; onConfirm: () => void; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved: boolean; onFinalize: () => void; isFinalizing: boolean }) {
   if (message.card?.type === "stays") return <article className="orin-message orin-card-message"><small>○ Orin</small><StayCards options={message.card.options} onSelect={onSelectStay} /></article>;
   if (message.card?.type === "confirmation") return <article className="orin-message orin-flow-message"><small>○ Orin</small><BookingConfirmation option={message.card.option} summary={message.card.summary} onConfirm={onConfirm} /></article>;
-  if (message.card?.type === "payment") return <article className="orin-message orin-flow-message"><small>○ Orin</small><PaymentSummary summary={message.card.summary} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={message.card.approved || approved} onFinalize={onFinalize} /></article>;
+  if (message.card?.type === "payment") return <article className="orin-message orin-flow-message"><small>○ Orin</small><PaymentSummary summary={message.card.summary} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} approved={message.card.approved || approved} onFinalize={onFinalize} isFinalizing={isFinalizing} /></article>;
   return message.role === "user" ? <div className="user-bubble"><p>{message.text}</p></div> : <article className="orin-message"><small>○ Orin</small><p>{renderTextWithLinks(message.text ?? "")}</p></article>;
 }
 
-function BookingScreen({ messages, isLoading, selectedStay, summary, paymentMethod, setPaymentMethod, approved, onSearch, onSelect, onConfirm, onFinalize }: { messages: ChatMessage[]; isLoading: boolean; selectedStay: CuratedStayOption | null; summary: BookingSummary | null; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved: boolean; onSearch: () => void; onSelect: (option: CuratedStayOption) => void; onConfirm: () => void; onFinalize: () => void }) {
+function BookingScreen({ messages, isLoading, selectedStay, summary, paymentMethod, setPaymentMethod, approved, onSearch, onSelect, onConfirm, onFinalize, isFinalizing }: { messages: ChatMessage[]; isLoading: boolean; selectedStay: CuratedStayOption | null; summary: BookingSummary | null; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved: boolean; onSearch: () => void; onSelect: (option: CuratedStayOption) => void; onConfirm: () => void; onFinalize: () => void; isFinalizing: boolean }) {
   const stayCards = messages.findLast((message) => message.card?.type === "stays")?.card;
   return <section className="booking-results"><div className="results-copy"><h1>Here are stays that match your style</h1><p>Choose a stay and ORIN will prepare the booking details for you in chat.</p></div><button className="auth-secondary refine-button" onClick={onSearch} disabled={isLoading} type="button">{isLoading ? "Curating stays..." : "Search curated stays"}</button>{isLoading && !stayCards ? <article className="curated-loading-card"><div className="spinner" /><strong>ORIN is matching stays to your profile.</strong><span>This usually takes a moment.</span></article> : null}{stayCards?.type === "stays" ? <StayCards options={stayCards.options} onSelect={onSelect} /> : null}{selectedStay && summary ? <BookingConfirmation option={selectedStay} summary={summary} onConfirm={onConfirm} passive /> : null}</section>;
 }
@@ -963,12 +1142,12 @@ function BookingConfirmation({ option, summary, onConfirm, passive }: { option: 
   return <article className="summary-card"><span>BOOKING SUMMARY</span><p>{option.hotelName} • {summary.checkInDate} - {summary.checkOutDate} • {summary.guests} guests</p>{!passive ? <div className="summary-actions"><button className="summary-confirm" onClick={onConfirm} type="button">Confirm details</button></div> : null}</article>;
 }
 
-function PaymentSummary({ summary, paymentMethod, setPaymentMethod, approved, onFinalize, passive }: { summary: BookingSummary; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved?: boolean; onFinalize: () => void; passive?: boolean }) {
-  return <article className="payment-summary-card"><h2>PAYMENT SUMMARY</h2>{summary.priceLines.map((line) => <div className="payment-line" key={line.label}><span>{line.label}</span><b>{line.lineType === "discount" ? "-" : ""}{formatCurrency(Math.abs(line.amount), summary.currency)}</b></div>)}<div className="payment-total"><span>Total</span><b>{formatCurrency(summary.payableTotal, summary.currency)}</b></div><div className="setup-panel"><div className="setup-avatar"><Ticket size={18} /></div><div><span>ORIN POINTS</span><p>Redeeming {summary.pointsRedemption.pointsUsed} points for {formatCurrency(summary.pointsRedemption.discountAmount, summary.currency)} off</p></div></div>{!passive ? <><div className="payment-method-grid"><button className={cn("payment-method", paymentMethod === "pusd" && "payment-method--active")} onClick={() => setPaymentMethod("pusd")} type="button">$PUSD</button><button className={cn("payment-method", paymentMethod === "mastercard" && "payment-method--active")} onClick={() => setPaymentMethod("mastercard")} type="button">Mastercard</button></div><button className="auth-primary auth-primary--enabled payment-button" disabled={!paymentMethod || approved} onClick={onFinalize} type="button">{approved ? "Booking approved" : paymentMethod ? "Final approval" : "Select payment method"}</button></> : null}</article>;
+function PaymentSummary({ summary, paymentMethod, setPaymentMethod, approved, onFinalize, isFinalizing, passive }: { summary: BookingSummary; paymentMethod: PaymentMethod | null; setPaymentMethod: (method: PaymentMethod) => void; approved?: boolean; onFinalize: () => void; isFinalizing?: boolean; passive?: boolean }) {
+  return <article className="payment-summary-card"><h2>PAYMENT SUMMARY</h2>{summary.priceLines.map((line) => <div className="payment-line" key={line.label}><span>{line.label}</span><b>{line.lineType === "discount" ? "-" : ""}{formatCurrency(Math.abs(line.amount), summary.currency)}</b></div>)}<div className="payment-total"><span>Total</span><b>{formatCurrency(summary.payableTotal, summary.currency)}</b></div><div className="setup-panel"><div className="setup-avatar"><Ticket size={18} /></div><div><span>ORIN POINTS</span><p>Redeeming {summary.pointsRedemption.pointsUsed} points for {formatCurrency(summary.pointsRedemption.discountAmount, summary.currency)} off</p></div></div>{!passive ? <><div className="payment-method-grid"><button className={cn("payment-method", paymentMethod === "pusd" && "payment-method--active")} onClick={() => setPaymentMethod("pusd")} type="button">$PUSD</button><button className={cn("payment-method", paymentMethod === "mastercard" && "payment-method--active")} onClick={() => setPaymentMethod("mastercard")} type="button">Mastercard</button></div><button className="auth-primary auth-primary--enabled payment-button" disabled={!paymentMethod || approved || isFinalizing} onClick={onFinalize} type="button">{approved ? "Booking approved" : isFinalizing ? "Finalizing..." : paymentMethod ? "Final approval" : "Select payment method"}</button></> : null}</article>;
 }
 
-function RoomScreen({ temp, setTemp, brightness, setBrightness, lighting, setLighting, music, setMusic, musicOn, setMusicOn, isSaving, onSave }: { temp: number; setTemp: (value: number) => void; brightness: number; setBrightness: (value: number) => void; lighting: LightingMode; setLighting: (value: LightingMode) => void; music: string; setMusic: (value: string) => void; musicOn: boolean; setMusicOn: (value: boolean) => void; isSaving: boolean; onSave: () => void }) {
-  return <section className="room-screen"><header className="room-header"><div className="room-header-copy"><strong>Room Control</strong><span>Live canonical state</span></div><button className="bookmark-button" type="button"><Zap size={18} /></button></header><div className="preset-strip">{[{ label: "Relax", temp: 22, brightness: 35, lighting: "warm" as LightingMode, music: "Jazz" }, { label: "Focus", temp: 21, brightness: 85, lighting: "cold" as LightingMode, music: "Lo-Fi" }, { label: "Sleep", temp: 19, brightness: 10, lighting: "ambient" as LightingMode, music: "Ambient" }].map((preset) => <button className="preset-pill" key={preset.label} onClick={() => { setTemp(preset.temp); setBrightness(preset.brightness); setLighting(preset.lighting); setMusic(preset.music); setMusicOn(true); }} type="button">{preset.label}</button>)}</div><ControlPanel label="TEMPERATURE" value={temp} min={16} max={30} suffix="°C" onChange={setTemp} /><ControlPanel label="LIGHTS" value={brightness} min={0} max={100} suffix="%" onChange={setBrightness} /><article className="music-panel"><div className="music-panel-header"><strong>♫ MUSIC</strong><span>{musicOn ? music : "Off"}</span></div><div className="music-options">{["Jazz", "Lo-Fi", "Ambient", "Classical"].map((option) => <button className={cn("music-option", musicOn && music === option && "music-option--active")} key={option} onClick={() => { setMusic(option); setMusicOn(true); }} type="button">{option}</button>)}<button className={cn("music-option", !musicOn && "music-option--active")} onClick={() => setMusicOn(false)} type="button">Off</button></div></article><button className="auth-primary auth-primary--enabled room-save" onClick={onSave} disabled={isSaving} type="button">{isSaving ? "Syncing..." : "Save My Setup"} <span className="button-arrow">→</span></button></section>;
+function RoomScreen({ temp, setTemp, brightness, setBrightness, lighting, setLighting, music, musicUrl, setMusic, musicOn, setMusicOn, isSaving, onSave }: { temp: number; setTemp: (value: number) => void; brightness: number; setBrightness: (value: number) => void; lighting: LightingMode; setLighting: (value: LightingMode) => void; music: string; musicUrl: string; setMusic: (value: string) => void; musicOn: boolean; setMusicOn: (value: boolean) => void; isSaving: boolean; onSave: () => void }) {
+  return <section className="room-screen"><header className="room-header"><div className="room-header-copy"><strong>Room Control</strong><span>Live canonical state</span></div><button className="bookmark-button" type="button"><Zap size={18} /></button></header><div className="preset-strip">{[{ label: "Relax", temp: 22, brightness: 35, lighting: "warm" as LightingMode, music: "Jazz" }, { label: "Focus", temp: 21, brightness: 85, lighting: "cold" as LightingMode, music: "Lo-Fi" }, { label: "Sleep", temp: 19, brightness: 10, lighting: "ambient" as LightingMode, music: "Ambient" }].map((preset) => <button className="preset-pill" key={preset.label} onClick={() => { setTemp(preset.temp); setBrightness(preset.brightness); setLighting(preset.lighting); setMusic(preset.music); setMusicOn(true); }} type="button">{preset.label}</button>)}</div><ControlPanel label="TEMPERATURE" value={temp} min={16} max={30} suffix="°C" onChange={setTemp} /><ControlPanel label="LIGHTS" value={brightness} min={0} max={100} suffix="%" onChange={setBrightness} /><article className="music-panel"><div className="music-panel-header"><strong>♫ MUSIC</strong><span>{musicOn ? music : "Off"}</span></div>{musicOn && musicUrl ? <audio className="music-url-player" controls src={musicUrl}>Your browser does not support audio playback.</audio> : null}<div className="music-options">{["Jazz", "Lo-Fi", "Ambient", "Classical"].map((option) => <button className={cn("music-option", musicOn && music === option && "music-option--active")} key={option} onClick={() => { setMusic(option); setMusicOn(true); }} type="button">{option}</button>)}<button className={cn("music-option", !musicOn && "music-option--active")} onClick={() => setMusicOn(false)} type="button">Off</button></div></article><button className="auth-primary auth-primary--enabled room-save" onClick={onSave} disabled={isSaving} type="button">{isSaving ? "Syncing..." : "Save My Setup"} <span className="button-arrow">→</span></button></section>;
 }
 
 function ControlPanel({ label, value, min, max, suffix, onChange }: { label: string; value: number; min: number; max: number; suffix: string; onChange: (value: number) => void }) {
@@ -976,6 +1155,6 @@ function ControlPanel({ label, value, min, max, suffix, onChange }: { label: str
   return <article className="control-panel"><div className="control-top"><strong>{label}</strong><b>{value}{suffix}</b></div><div className="slider-shell"><div className="slider-track" /><div className="slider-progress" style={{ width: `${percentage}%` }} /><input className="slider-input" max={max} min={min} onChange={(event) => onChange(Number(event.target.value))} type="range" value={value} /></div><div className="control-range"><span>{min}{suffix}</span><span>{max}{suffix}</span></div></article>;
 }
 
-function ProfileScreen({ guestName, walletLabel, profileImage, persona, points, temp, brightness, lighting, music, onAvatarChange }: { guestName: string; walletLabel: string; profileImage: string | null; persona: string; points: number; temp: number; brightness: number; lighting: string; music: string; onAvatarChange: (event: React.ChangeEvent<HTMLInputElement>) => void }) {
-  return <section className="mobile-profile mobile-profile--post-onboarding"><article className="identity-card"><div className="identity-top"><div className="identity-avatar">{profileImage ? <Image src={profileImage} alt="Profile" fill className="object-cover" unoptimized /> : <UserRound />}</div><div className="identity-copy"><strong>{guestName}</strong><span>{walletLabel}</span><p>Member since May 2026</p></div><label className="verified-badge"><Camera size={13} /> Photo<input className="hidden" type="file" accept="image/*" onChange={onAvatarChange} /></label></div><div className="identity-stats"><span>ORIN Points</span><strong className="identity-points">{points} pts</strong></div><div className="identity-meter"><div /></div><div className="identity-foot"><span>{persona}</span></div></article><div className="profile-section"><h2>Saved Preferences</h2><div className="profile-list-card">{[{ label: `Climate ${temp}°C`, icon: Thermometer }, { label: `Lighting ${lighting} / ${brightness}%`, icon: Lightbulb }, { label: `Music ${music}`, icon: Music }].map((item) => <div className="profile-row" key={item.label}><span className="profile-row-icon"><item.icon size={18} /></span><strong>{item.label}</strong></div>)}</div></div><div className="profile-section"><h2>Wallet</h2><div className="profile-wallet-card"><span className="profile-row-icon"><Wallet size={18} /></span><div className="profile-wallet-copy"><strong>Connected Wallet</strong><small>{walletLabel}</small></div><span className="wallet-ok"><Check size={16} /></span></div></div></section>;
+function ProfileScreen({ guestName, walletLabel, profileImage, persona, points, temp, brightness, lighting, music, onAvatarChange, onAirdropPusd, isAirdroppingPusd }: { guestName: string; walletLabel: string; profileImage: string | null; persona: string; points: number; temp: number; brightness: number; lighting: string; music: string; onAvatarChange: (event: React.ChangeEvent<HTMLInputElement>) => void; onAirdropPusd: () => void; isAirdroppingPusd: boolean }) {
+  return <section className="mobile-profile mobile-profile--post-onboarding"><article className="identity-card"><div className="identity-top"><div className="identity-avatar">{profileImage ? <Image src={profileImage} alt="Profile" fill className="object-cover" unoptimized /> : <UserRound />}</div><div className="identity-copy"><strong>{guestName}</strong><span>{walletLabel}</span><p>Member since May 2026</p></div><label className="verified-badge"><Camera size={13} /> Photo<input className="hidden" type="file" accept="image/*" onChange={onAvatarChange} /></label></div><div className="identity-stats"><span>ORIN Points</span><strong className="identity-points">{points} pts</strong></div><div className="identity-meter"><div /></div><div className="identity-foot"><span>{persona}</span></div></article><div className="profile-section"><h2>Saved Preferences</h2><div className="profile-list-card">{[{ label: `Climate ${temp}°C`, icon: Thermometer }, { label: `Lighting ${lighting} / ${brightness}%`, icon: Lightbulb }, { label: `Music ${music}`, icon: Music }].map((item) => <div className="profile-row" key={item.label}><span className="profile-row-icon"><item.icon size={18} /></span><strong>{item.label}</strong></div>)}</div></div><div className="profile-section"><h2>Wallet</h2><div className="profile-wallet-card"><span className="profile-row-icon"><Wallet size={18} /></span><div className="profile-wallet-copy"><strong>Connected Wallet</strong><small>{walletLabel}</small></div><span className="wallet-ok"><Check size={16} /></span></div><button className="auth-primary auth-primary--enabled pusd-airdrop-button" onClick={onAirdropPusd} disabled={isAirdroppingPusd} type="button">{isAirdroppingPusd ? "Airdropping..." : "Airdrop $PUSD"}</button></div></section>;
 }
